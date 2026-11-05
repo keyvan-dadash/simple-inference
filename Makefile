@@ -139,3 +139,17 @@ ai-dma-prefill-build: $(AIPREF)
 
 ai-dma-prefill: $(AIPREF)
 	sudo sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; export TCM_BLOCK="$$6" PREFILL_VERIFY_TILES="$$7"; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(AIPREF)" "$(WEIGHTS)" "$(PREFILL_TOKENS)" "$(PREFILL_PREFIX)" "$(PREFILL_REPEAT)" "$(TCM_BLOCK)" "$(PREFILL_VERIFY_TILES)"
+
+# Register-fused, head-pair-stationary causal prefill. One complete 240-KiB
+# Q (or KV) tile and the first 120-KiB W_O in TCM per 100-token window.
+# The rest of W_O remains in DDR/L2 (480KiB Q+W_O cannot fit in 384KiB).
+RSPREF = $(BUILD_DIR)/bench_register_stationary_prefill
+
+$(RSPREF): bench_register_stationary_prefill.c register_stationary_prefill.h ai_dma_pipeline.h tcm_three_banks.h $(COMMON) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o "$@" bench_register_stationary_prefill.c $(LDFLAGS)
+
+.PHONY: ai-dma-register-prefill-build ai-dma-register-prefill
+ai-dma-register-prefill-build: $(RSPREF)
+
+ai-dma-register-prefill: $(RSPREF)
+	sudo sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; export TCM_BLOCK="$$6" PREFILL_VERIFY_TILES="$$7"; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(RSPREF)" "$(WEIGHTS)" "$(PREFILL_TOKENS)" "$(PREFILL_PREFIX)" "$(PREFILL_REPEAT)" "$(TCM_BLOCK)" "$(PREFILL_VERIFY_TILES)"
