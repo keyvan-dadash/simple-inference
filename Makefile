@@ -120,3 +120,22 @@ $(AIDMAF): bench_ai_dma_fusion.c ai_dma_pipeline.h tcm_three_banks.h $(COMMON) |
 .PHONY: ai-dma-fusion
 ai-dma-fusion: $(AIDMAF)
 	TCM_BLOCK="$(TCM_BLOCK)" TCM_PIN_PAIR="$(AI_DMA_PIN_PAIR)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(AIDMAF)" "$(WEIGHTS)" "$(CONTEXT)" "$(AI_DMA_REPEAT)" "$(AI_DMA_MODE)"
+
+# Causal weight-stationary PREFILL: one AI-DMA weight transfer per tile per
+# prompt batch; tile is applied to ALL prompt tokens before it is replaced.
+# This leaves the decode benchmarks untouched. /dev/udma allocation is root
+# only on the Firefly, so run the compiled benchmark as root (not `sudo make`).
+PREFILL_TOKENS ?= 100
+PREFILL_PREFIX ?= 0
+PREFILL_REPEAT ?= 1
+PREFILL_VERIFY_TILES ?= 0
+AIPREF = $(BUILD_DIR)/bench_ai_dma_prefill
+
+$(AIPREF): bench_ai_dma_prefill.c prefill_weight_stationary.h ai_dma_pipeline.h tcm_three_banks.h $(COMMON) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o "$@" bench_ai_dma_prefill.c $(LDFLAGS)
+
+.PHONY: ai-dma-prefill-build ai-dma-prefill
+ai-dma-prefill-build: $(AIPREF)
+
+ai-dma-prefill: $(AIPREF)
+	sudo sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; export TCM_BLOCK="$$6" PREFILL_VERIFY_TILES="$$7"; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(AIPREF)" "$(WEIGHTS)" "$(PREFILL_TOKENS)" "$(PREFILL_PREFIX)" "$(PREFILL_REPEAT)" "$(TCM_BLOCK)" "$(PREFILL_VERIFY_TILES)"
