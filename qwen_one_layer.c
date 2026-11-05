@@ -1,9 +1,6 @@
-// One-token Qwen2.5-Coder-1.5B attention sublayer. No inference engine.
-// Q4_0 weights x on-the-fly Q8_0 activations -> FP32 Q/K/V -> RoPE
-// -> synthetic FP16 KV history + selectable GQA -> Q8_0 x Q4_0 output projection.
-// Meant for isolated profiling and later fusion experiments, NOT text inference.
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
@@ -15,22 +12,13 @@
 
 #include "defines.h"
 
-typedef struct { uint16_t d; int8_t qs[QK]; } block_q8_0;
-_Static_assert(sizeof(block_q8_0) == Q8_BYTES, "Q8_0 layout should be 34 bytes");
-
-typedef struct {
-    uint8_t *wq, *wk, *wv, *wo;
-    float *norm, *bq, *bk, *bv;
-} layer_t;
-
-typedef struct {
-    float rms, q8_input, q_proj, k_proj, v_proj, rope_cache, attention, q8_output, out_proj;
-} phase_t;
+// No block_q8_0, layer_t, or phase_t typedefs here.
 
 static double seconds_now(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
-        perror("clock_gettime"); exit(1);
+        perror("clock_gettime");
+        exit(1);
     }
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
