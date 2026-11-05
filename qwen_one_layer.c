@@ -281,6 +281,7 @@ static phase_t run_layer(const layer_t *l, const float *x,
 }
 
 #include "fused_layer.h"
+#include "register_fusion.h"
 #include "soa_staged.h"
 
 // Human-readable sizes are binary KiB/MiB. These are storage footprints,
@@ -542,6 +543,10 @@ static void report_fusion(const phase_t *base, const fused_stats_t *fused,
            context,repeat,HAVE_RVV ? "yes" : "no",tcm_mode ? "enabled" : "off");
     printf("All weights remain 4-bit Q4_0; activations Q8_0; KV FP16.\n");
     printf("One token, two heads, 256 output neurons per RVV tile.\n");
+    if (HAVE_RVV) {
+        puts("NOTE: Fused 'Online attention' timing now INCLUDES Q projection, Q RoPE, attention, Q8 and W_O.");
+        puts("There are NO stage timers inside that register-resident core.");
+    }
     puts("--------------------------------------------------------------------------");
     printf(" %-24s %15s %15s %10s\n", "Operation", "Baseline ms", "Fused ms", "Speedup");
     puts("--------------------------------------------------------------------------");
@@ -664,15 +669,20 @@ int main(int argc, char **argv) {
                     int method = (r&1L) ? 1-j : j;
                     if (method==0) {
                         phase_t pp=run_layer(&l,input,kc,vc,(int)context,output[0],
-                                             ATTENTION_FLASH,scores,a0,b0);
+                                             ATTENTION_FLASH,scores,NULL,NULL);
                         phase_add(&sums[0],pp);
                     } else {
                         fused_stats_t fp=run_layer_fused(&l,&fw,input,kc,vc,
-                                               (int)context,fy,a1,b1);
+                                               (int)context,fy,NULL,NULL);
                         fused_stats_add(&fs,fp);
                     }
                 }
             }
+            /* Capture only during an untimed replay. Capturing O/Q8 to RAM
+             * in the measured fused path would defeat register residency. */
+            (void)run_layer(&l,input,kc,vc,(int)context,output[0],
+                            ATTENTION_FLASH,scores,a0,b0);
+            (void)run_layer_fused(&l,&fw,input,kc,vc,(int)context,fy,a1,b1);
             report_fusion(&sums[0],&fs,(int)context,(int)repeat,tcm_enabled,
                           output[0],fy,a0,a1,b0,b1);
         } else {
@@ -686,7 +696,7 @@ int main(int argc, char **argv) {
             }
             double ch=checksum_and_validate(fy);
             printf("%s one-token | context=%ld repeats=%ld RVV=%s TCM=%s\n",
-                   staged_mode ? "SOA STAGED" : "SOA FUSED",
+                   staged_mode ? "SOA STAGED" : "REGISTER FUSED",
                    context,repeat,HAVE_RVV?"yes":"no", tcm_enabled?"yes":"no");
             printf("Compute %.3f ms/token, staging %.3f ms/token, all %.3f ms/token\n",
                    (fused_total(&fs)-fs.tcm_stage)*1e3/repeat,

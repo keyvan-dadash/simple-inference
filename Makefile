@@ -3,6 +3,7 @@
 CC         = gcc
 VECTOR    ?= 1
 BUILD_DIR ?= build
+RVV_ARCH  ?= rv64gcv_zvfh_zfh_zicbop
 CFLAGS    ?= -O2 -std=c11 -Wall -Wextra -Wshadow -ffp-contract=off
 LDFLAGS   ?= -lm
 GGUF      ?=
@@ -15,18 +16,18 @@ FUSED_TCM ?= 0
 TCM_BLOCK ?= 0
 
 ifeq ($(VECTOR),1)
-CFLAGS += -march=rv64gcv_zicbop -mabi=lp64d -DUSE_RVV=1
+CFLAGS += -march=$(RVV_ARCH) -mabi=lp64d -DUSE_RVV=1
 else
 CFLAGS += -DUSE_RVV=0
 endif
 
-COMMON = qwen_one_layer.c attention_kernels.h fused_layer.h soa_staged.h defines.h
+COMMON = qwen_one_layer.c attention_kernels.h fused_layer.h register_fusion.h soa_staged.h defines.h
 BIN = $(BUILD_DIR)/qwen_one_layer
 AUDIT = $(BUILD_DIR)/audit_fusion_timing
 VERIFY = $(BUILD_DIR)/verify_fused_projections
 LLAMA = $(BUILD_DIR)/bench_llama_fusion
 
-.PHONY: all extract repack run a100 audit three-way reference soa-staged soa-fused verify llama-baseline test clean
+.PHONY: all extract repack run a100 audit three-way reference soa-staged soa-fused verify llama-baseline reg-asm test clean
 all: $(BIN)
 
 $(BUILD_DIR):
@@ -59,7 +60,7 @@ a100: $(BIN)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(BIN)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)" "$(ATTENTION)"
 
 # Official three-way baseline: (A) generic llama.cpp-style RVV row-major,
-# (B) column-SoA RVV staged, (C) same column-SoA RVV paired fusion.
+# (B) old column-SoA RVV staged, (C) new register-fused Q->attn->W_O.
 # This reuses the independent, wall-clock-tested audit harness.
 three-way: audit
 
@@ -71,13 +72,17 @@ soa-staged: a100
 soa-fused: ATTENTION = soa-fused
 soa-fused: a100
 
-# Audit controls share the same kernels for staged vs fused.
+# NOTE: fused core changes Zvfh, exp approximation, and W_O; not a pure schedule comparison.
 audit: $(AUDIT)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4"' sh "$(AUDIT)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)"
 
 # New matched control: original ggml-like Q4_0 RVV dot in both paths.
 llama-baseline: $(LLAMA)
 	sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4"' sh "$(LLAMA)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)"
+
+# Review compiler-emitted vector saves/spills in the new fused path.
+reg-asm: $(COMMON) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -S -o "$(BUILD_DIR)/register_fusion.s" qwen_one_layer.c
 
 verify: $(VERIFY)
 	sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2"' sh "$(VERIFY)" "$(WEIGHTS)"

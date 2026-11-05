@@ -1,12 +1,12 @@
 /*
  * Independent three-way single-layer timing audit for simple-inference:
  *   A. original Q4_0 row-major + scalar-head online attention
- *   B. same repacked column-SoA RVV kernels, UNFUSED stage ordering
- *   C. existing two-head paired fused schedule
+ *   B. original repacked column-SoA RVV kernels, UNFUSED stage ordering
+ *   C. experimental register-resident Q -> attention -> W_O path
  *
  * Build INSIDE simple-inference (after removing duplicate typedefs from .c):
  * gcc -O2 -std=c11 -Wall -Wextra -Wshadow -ffp-contract=off \
- *     -march=rv64gcv_zicbop -mabi=lp64d -DUSE_RVV=1 \
+ *     -march=rv64gcv_zvfh_zfh_zicbop -mabi=lp64d -DUSE_RVV=1 \
  *     -o audit_fusion_timing audit_fusion_timing.c -lm
  *
  * Run: sh -c 'echo $$ > /proc/set_ai_thread || exit 1; \
@@ -246,8 +246,8 @@ int main(int argc, char **argv) {
     printf("\nWHOLE-LAYER WALL SPEEDUPS: original/fused %.3fx | "
            "same-SoA staged/fused %.3fx\n", refwall/fusewall, ctrlwall/fusewall);
     printf("   Original/fused mixes layout, kernel, attention and fusion changes.\n");
-    printf("   SoA staged/fused isolates schedule + materialization (approximately),\n"
-           "   using exactly the same projection/attention kernels.\n");
+    printf("   WARNING: staged/fused now mixes register handoff, Zvfh KV conversions,\n"
+           "   exp approximation, and W_O subkernel changes. NOT schedule-only.\n");
     printf("   Gap = measured wall minus sum of phase timers (incl. TCM).\n"
            "   Gap includes Y zeroing, timer/bookkeeping gaps and other overhead.\n");
     for (int m = 0; m < AUDIT_METHODS; ++m) {
@@ -262,6 +262,8 @@ int main(int argc, char **argv) {
     const int stage_map[] = {0,1,2,3,5,6,7,8};
     puts("\nSTAGE TIMER MEANS (ms/call; TCM staging shown separately above)");
     printf(" %-21s %14s %14s %14s\n", "Stage", "Original", "SoA staged", "SoA fused");
+    puts("Note: fused 'Online attention' column is the ENTIRE Q+RoPE+attention+Q8+W_O core;");
+    puts("      fused Wq/Quantize O/W_O cells are zero by timing design, not missing work.");
     for (int k = 0; k < AUDIT_PHASES; ++k) {
         int n = stage_map[k];
         printf(" %-21s", ops[k]);

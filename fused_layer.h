@@ -394,7 +394,7 @@ static void attention_wo_fused(const fused_weights_t *fw, const float *qpair,
  * Partial Y is a 6KiB ordinary-memory vector buffer, RVV updated six times.
  * Weight tiles are contiguous column-major Q4_0 SoA, optionally TCM staged.
  */
-static fused_stats_t run_layer_fused(const layer_t *l,
+static fused_stats_t run_layer_legacy_fused(const layer_t *l,
                                      const fused_weights_t *fw,
                                      const float *x,
                                      uint16_t *kc, uint16_t *vc,
