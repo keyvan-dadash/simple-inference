@@ -51,102 +51,8 @@ static double audit_phase_sum(const phase_t *p) {
            p->rope_cache + p->attention + p->q8_output + p->out_proj;
 }
 
-static fused_stats_t audit_run_unfused_soa(const layer_t *l,
-                                            const fused_weights_t *fw,
-                                            const float *x,
-                                            uint16_t *kc, uint16_t *vc,
-                                            int context, float *out,
-                                            float *attn_copy,
-                                            block_q8_0 *q8_copy) {
-    /* Same RVV projection + attention + W_o functions as the fused path.
-     * Deliberately materialize all Q, all FP32 attention O and Q8 O.
-     * Staging count and weight/activation arithmetic are the same as fused.
-     * Only ordering and inter-stage buffering are changed. */
-    float normalized[HIDDEN];
-    block_q8_0 xq8[HIDDEN / QK];
-    float all_q[HIDDEN], all_o[HIDDEN];
-    block_q8_0 all_oq[HIDDEN / QK];
-    fused_stats_t stats = {0};
-    double start = seconds_now();
-    rmsnorm(x, l->norm, normalized);
-    stats.phase.rms += (float)(seconds_now() - start);
-    start = seconds_now();
-    quantize_q8(normalized, xq8, HIDDEN);
-    stats.phase.q8_input += (float)(seconds_now() - start);
-    memset(out, 0, HIDDEN * sizeof(float));
-
-    /* K/V for both groups first, once each. */
-    for (int group = 0; group < KVHEADS; ++group) {
-        const uint8_t *tile = fused_stage_tile(fw,
-            fw->kv + (size_t)group * FUSED_TILE_BYTES, &stats);
-        float both[256];
-        start = seconds_now();
-        fused_column_matvec(tile, xq8, HIDDEN / QK,
-            l->bk ? l->bk + group * HDIM : NULL,
-            l->bv ? l->bv + group * HDIM : NULL, both, 0);
-        double elapsed = seconds_now() - start;
-        stats.phase.k_proj += (float)(elapsed / 2);
-        stats.phase.v_proj += (float)(elapsed / 2);
-
-        start = seconds_now();
-        rope(both, 1, context - 1);
-        size_t offset = (size_t)(context - 1) * KVDIM +
-                        (size_t)group * HDIM;
-        for (int j = 0; j < HDIM; ++j) {
-            kc[offset + j] = f32_to_f16(both[j]);
-            vc[offset + j] = f32_to_f16(both[j + HDIM]);
-        }
-        stats.phase.rope_cache += (float)(seconds_now() - start);
-    }
-
-    /* All six query pairs before the attention stage. */
-    for (int pair = 0; pair < QHEADS / 2; ++pair) {
-        const uint8_t *tile = fused_stage_tile(fw,
-            fw->q + (size_t)pair * FUSED_TILE_BYTES, &stats);
-        const float *bias = l->bq ? l->bq + pair * 256 : NULL;
-        start = seconds_now();
-        fused_column_matvec(tile, xq8, HIDDEN / QK,
-            bias, bias ? bias + 128 : NULL, all_q + pair * 256, 0);
-        stats.phase.q_proj += (float)(seconds_now() - start);
-        start = seconds_now();
-        rope(all_q + pair * 256, 2, context - 1);
-        stats.phase.rope_cache += (float)(seconds_now() - start);
-    }
-
-    /* All six attention pairs, preserving the *same paired RVV kernel*.
-     * Contrasts fusion scheduling instead of conflating the speed of the
-     * original scalar attention and the new vector attention. */
-    for (int pair = 0; pair < QHEADS / 2; ++pair) {
-        start = seconds_now();
-        fused_attention_pair(all_q + pair * 256, kc, vc,
-                             context, pair / 3, all_o + pair * 256);
-        stats.phase.attention += (float)(seconds_now() - start);
-    }
-
-    /* One full attention materialization and quantization, unlike fusion. */
-    start = seconds_now();
-    quantize_q8(all_o, all_oq, HIDDEN);
-    stats.phase.q8_output += (float)(seconds_now() - start);
-
-    /* All six O pairs contribute to all six 256-output Y tiles. */
-    for (int pair = 0; pair < QHEADS / 2; ++pair) {
-        const uint8_t *tile = fused_stage_tile(fw,
-            fw->o + (size_t)pair * FUSED_TILE_BYTES, &stats);
-        start = seconds_now();
-        for (int ytile = 0; ytile < HIDDEN / 256; ++ytile) {
-            fused_column_matvec(tile + (size_t)ytile * FUSED_WO_SUBTILE,
-                                all_oq + pair * 8, 8, NULL, NULL,
-                                out + ytile * 256, 1);
-        }
-        stats.phase.out_proj += (float)(seconds_now() - start);
-    }
-
-    /* Optional output captures explicitly EXCLUDED from phase timers.
-     * The timed caller always supplies NULL; verification runs after timing. */
-    if (attn_copy) memcpy(attn_copy, all_o, sizeof(all_o));
-    if (q8_copy) memcpy(q8_copy, all_oq, sizeof(all_oq));
-    return stats;
-}
+/* SoA/RVV staged baseline lives in soa_staged.h, included by qwen_one_layer.c.
+ * The audit and the single-mode CLI now share the identical implementation. */
 
 static double audit_median(double *arr, int n);
 
@@ -285,7 +191,7 @@ int main(int argc, char **argv) {
             (void)run_layer(&layer, x, kc[m], vc[m], (int)context,
                             out[m], ATTENTION_FLASH, scores, NULL, NULL);
         else if (m == 1)
-            (void)audit_run_unfused_soa(&layer, &fw, x, kc[m], vc[m],
+            (void)run_layer_soa_staged(&layer, &fw, x, kc[m], vc[m],
                                          (int)context, out[m], NULL, NULL);
         else
             (void)run_layer_fused(&layer, &fw, x, kc[m], vc[m],
@@ -304,7 +210,7 @@ int main(int argc, char **argv) {
                 p = run_layer(&layer, x, kc[m], vc[m], (int)context,
                               out[m], ATTENTION_FLASH, scores, NULL, NULL);
             } else if (m == 1) {
-                fused_stats_t s = audit_run_unfused_soa(&layer, &fw, x,
+                fused_stats_t s = run_layer_soa_staged(&layer, &fw, x,
                                    kc[m], vc[m], (int)context,
                                    out[m], NULL, NULL);
                 p = s.phase;
@@ -370,7 +276,7 @@ int main(int argc, char **argv) {
     /* Numerical checks are run entirely OUTSIDE timing. */
     (void)run_layer(&layer, x, kc[0], vc[0], (int)context, out[0],
                     ATTENTION_FLASH, scores, attention[0], q8[0]);
-    (void)audit_run_unfused_soa(&layer, &fw, x, kc[1], vc[1],
+    (void)run_layer_soa_staged(&layer, &fw, x, kc[1], vc[1],
                                  (int)context, out[1], attention[1], q8[1]);
     (void)run_layer_fused(&layer, &fw, x, kc[2], vc[2],
                           (int)context, out[2], attention[2], q8[2]);

@@ -20,13 +20,13 @@ else
 CFLAGS += -DUSE_RVV=0
 endif
 
-COMMON = qwen_one_layer.c attention_kernels.h fused_layer.h defines.h
+COMMON = qwen_one_layer.c attention_kernels.h fused_layer.h soa_staged.h defines.h
 BIN = $(BUILD_DIR)/qwen_one_layer
 AUDIT = $(BUILD_DIR)/audit_fusion_timing
 VERIFY = $(BUILD_DIR)/verify_fused_projections
 LLAMA = $(BUILD_DIR)/bench_llama_fusion
 
-.PHONY: all extract repack run a100 audit verify llama-baseline test clean
+.PHONY: all extract repack run a100 audit three-way reference soa-staged soa-fused verify llama-baseline test clean
 all: $(BIN)
 
 $(BUILD_DIR):
@@ -58,7 +58,20 @@ run: $(BIN)
 a100: $(BIN)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(BIN)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)" "$(ATTENTION)"
 
-# Old three-way experiment; mixes changes to kernel/layout/attention in first comparison.
+# Official three-way baseline: (A) generic llama.cpp-style RVV row-major,
+# (B) column-SoA RVV staged, (C) same column-SoA RVV paired fusion.
+# This reuses the independent, wall-clock-tested audit harness.
+three-way: audit
+
+# Individual modes use the same qwen_one_layer driver for stable inputs.
+reference: ATTENTION = reference
+reference: a100
+soa-staged: ATTENTION = soa-staged
+soa-staged: a100
+soa-fused: ATTENTION = soa-fused
+soa-fused: a100
+
+# Audit controls share the same kernels for staged vs fused.
 audit: $(AUDIT)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4"' sh "$(AUDIT)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)"
 

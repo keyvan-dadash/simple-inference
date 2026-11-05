@@ -281,6 +281,7 @@ static phase_t run_layer(const layer_t *l, const float *x,
 }
 
 #include "fused_layer.h"
+#include "soa_staged.h"
 
 // Human-readable sizes are binary KiB/MiB. These are storage footprints,
 // NOT the bytes transferred by hardware: data can be read many times.
@@ -590,7 +591,7 @@ static void report_fusion(const phase_t *base, const fused_stats_t *fused,
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s <weights_directory> [context=256] [repeat=1] [standard|flash|compare|fused|fused-compare]\n",
+                "Usage: %s <weights_directory> [context=256] [repeat=1] [standard|flash|compare|fused|fused-compare|reference|soa-staged|soa-fused]\n",
                 argv[0]);
         return 2;
     }
@@ -603,11 +604,16 @@ int main(int argc, char **argv) {
         die("Context must be 1..32768 and repeat 1..100000");
     const char *mode = argc >= 5 ? argv[4] : "compare";
     int compare = strcmp(mode,"compare")==0;
-    int fused_mode = strcmp(mode,"fused")==0 || strcmp(mode,"fused-compare")==0;
+    int reference_mode = strcmp(mode,"reference")==0;
+    int staged_mode = strcmp(mode,"soa-staged")==0;
+    int fused_mode = strcmp(mode,"fused")==0 ||
+                     strcmp(mode,"fused-compare")==0 ||
+                     strcmp(mode,"soa-fused")==0 || staged_mode;
     int fused_compare = strcmp(mode,"fused-compare")==0;
     int selected = strcmp(mode,"standard")==0 ? ATTENTION_STANDARD : ATTENTION_FLASH;
-    if (!compare && !fused_mode && strcmp(mode,"standard") && strcmp(mode,"flash"))
-        die("Attention mode must be standard, flash, compare, fused or fused-compare");
+    if (!compare && !fused_mode && !reference_mode &&
+        strcmp(mode,"standard") && strcmp(mode,"flash"))
+        die("Attention mode must be standard, flash, compare, fused, fused-compare, reference, soa-staged or soa-fused");
 
     layer_t l = load_layer(argv[1]);
     float *input = malloc(HIDDEN * sizeof(float));
@@ -671,12 +677,16 @@ int main(int argc, char **argv) {
                           output[0],fy,a0,a1,b0,b1);
         } else {
             for (long r=0;r<repeat;r++) {
-                fused_stats_t fp=run_layer_fused(&l,&fw,input,kc,vc,
-                                                 (int)context,fy,NULL,NULL);
+                fused_stats_t fp = staged_mode
+                    ? run_layer_soa_staged(&l,&fw,input,kc,vc,
+                                           (int)context,fy,NULL,NULL)
+                    : run_layer_fused(&l,&fw,input,kc,vc,
+                                      (int)context,fy,NULL,NULL);
                 fused_stats_add(&fs,fp);
             }
             double ch=checksum_and_validate(fy);
-            printf("FUSED one-token 2-head | context=%ld repeats=%ld RVV=%s TCM=%s\n",
+            printf("%s one-token | context=%ld repeats=%ld RVV=%s TCM=%s\n",
+                   staged_mode ? "SOA STAGED" : "SOA FUSED",
                    context,repeat,HAVE_RVV?"yes":"no", tcm_enabled?"yes":"no");
             printf("Compute %.3f ms/token, staging %.3f ms/token, all %.3f ms/token\n",
                    (fused_total(&fs)-fs.tcm_stage)*1e3/repeat,
