@@ -60,8 +60,8 @@ a100: $(BIN)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(BIN)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)" "$(ATTENTION)"
 
 # Official three-way baseline: (A) generic llama.cpp-style RVV row-major,
-# (B) old column-SoA RVV staged, (C) new register-fused Q->attn->W_O.
-# This reuses the independent, wall-clock-tested audit harness.
+# (B) matched staged using exactly the same rf_* kernels as (C) register fusion.
+# Timing differences isolate full Q/O/Q8 materialization and compiler effects.
 three-way: audit
 
 # Individual modes use the same qwen_one_layer driver for stable inputs.
@@ -72,7 +72,7 @@ soa-staged: a100
 soa-fused: ATTENTION = soa-fused
 soa-fused: a100
 
-# NOTE: fused core changes Zvfh, exp approximation, and W_O; not a pure schedule comparison.
+# Matched staged/fused both use Zvfh, the same exp approximation and W_O kernel.
 audit: $(AUDIT)
 	FUSED_TCM="$(FUSED_TCM)" TCM_BLOCK="$(TCM_BLOCK)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4"' sh "$(AUDIT)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)"
 
@@ -92,3 +92,16 @@ test: verify
 # Doesn't remove or modify your extracted weights, sources, or old root binaries.
 clean:
 	rm -rf "$(BUILD_DIR)"
+
+# TCM experiment: three 30-KiB Q/KV/W_O banks; normal KV cache always DDR/L2.
+# 1 = stream every chunk, 2 = permanently pin one chunk of each family
+TCM_TILE_MODE ?= 1
+TCM_PIN_PAIR ?= 0
+TCM3 = $(BUILD_DIR)/bench_tcm_three_banks
+
+$(TCM3): bench_tcm_three_banks.c tcm_three_banks.h $(COMMON) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o "$@" bench_tcm_three_banks.c $(LDFLAGS)
+
+.PHONY: tcm-three-banks
+tcm-three-banks: $(TCM3)
+	TCM_BLOCK="$(TCM_BLOCK)" TCM_PIN_PAIR="$(TCM_PIN_PAIR)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(TCM3)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)" "$(TCM_TILE_MODE)"
