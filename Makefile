@@ -105,3 +105,18 @@ $(TCM3): bench_tcm_three_banks.c tcm_three_banks.h $(COMMON) | $(BUILD_DIR)
 .PHONY: tcm-three-banks
 tcm-three-banks: $(TCM3)
 	TCM_BLOCK="$(TCM_BLOCK)" TCM_PIN_PAIR="$(TCM_PIN_PAIR)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(TCM3)" "$(WEIGHTS)" "$(CONTEXT)" "$(REPEAT)" "$(TCM_TILE_MODE)"
+
+# Real AI-DMA variant: asynchronous 30KiB Q/KV/W_O weight ping-pong +
+# optional 90KiB cross-token pinned resident bank. Does not affect old modes.
+# WARNING: vendor AI-DMA driver leaks descriptors per transfer. Limit tests.
+AI_DMA_REPEAT ?= 5
+AI_DMA_MODE ?= 2
+AI_DMA_PIN_PAIR ?= 0
+AIDMAF = $(BUILD_DIR)/bench_ai_dma_fusion
+
+$(AIDMAF): bench_ai_dma_fusion.c ai_dma_pipeline.h tcm_three_banks.h $(COMMON) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o "$@" bench_ai_dma_fusion.c $(LDFLAGS)
+
+.PHONY: ai-dma-fusion
+ai-dma-fusion: $(AIDMAF)
+	TCM_BLOCK="$(TCM_BLOCK)" TCM_PIN_PAIR="$(AI_DMA_PIN_PAIR)" sh -c 'echo $$$$ > /proc/set_ai_thread || exit 1; exec taskset -c 8 "$$1" "$$2" "$$3" "$$4" "$$5"' sh "$(AIDMAF)" "$(WEIGHTS)" "$(CONTEXT)" "$(AI_DMA_REPEAT)" "$(AI_DMA_MODE)"

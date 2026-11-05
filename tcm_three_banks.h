@@ -21,12 +21,21 @@
 _Static_assert(RT_BYTES == 30720u, "unexpected SoA microtile geometry");
 _Static_assert(RT_CAPACITY == 92160u, "unexpected three-bank geometry");
 
-enum { RT_DDR=0, RT_STREAM=1, RT_PIN=2 };
+enum { RT_DDR=0, RT_STREAM=1, RT_PIN=2, RT_AIDMA=3, RT_AIDMA_PIN=4 };
 enum { RT_KIND_Q=0, RT_KIND_KV=1, RT_KIND_WO=2 };
 typedef struct {
     int mode, pinned_pair;
     uint8_t *q_bank, *kv_bank, *wo_bank;
+#if defined(RT_ENABLE_AIDMA)
+    struct rt_ai_pipeline *ai;
+#endif
 } rt_workspace_t;
+
+#if defined(RT_ENABLE_AIDMA)
+/* The implementation is in ai_dma_pipeline.h, included by the opt-in bench. */
+static const uint8_t *rt_ai_take(rt_workspace_t *rt,int kind,int index,
+                                 int yt,int start,const uint8_t *src,int n);
+#endif
 
 /* Inline scalar-only volatile stores keep weights in the scratchpad without
  * a C call that could clobber Q/O registers. Inspect GCC output on A100. */
@@ -39,8 +48,14 @@ RF_INLINE void rt_copy_tcm(uint8_t *dest,const uint8_t *src,size_t n) {
 
 static void rt_init(rt_workspace_t *rt,const fused_weights_t *fw,
                     int mode,int pair) {
-    if(mode<RT_DDR || mode>RT_PIN || pair<0 || pair>=QHEADS/2)
+    if(mode<RT_DDR || pair<0 || pair>=QHEADS/2)
         die("Invalid TCM 3-bank configuration");
+#if defined(RT_ENABLE_AIDMA)
+    if(mode>RT_AIDMA_PIN) die("Invalid TCM 3-bank mode");
+    rt->ai=NULL;
+#else
+    if(mode>RT_PIN) die("AI-DMA mode requires the dedicated benchmark");
+#endif
     if(!fw->tcm_tile) die("TCM 3-bank benchmark requires mapped TCM");
     /* The existing driver already requires >= 240KiB, enough for 90KiB. */
     rt->mode=mode;rt->pinned_pair=pair;
@@ -58,6 +73,10 @@ static void rt_init(rt_workspace_t *rt,const fused_weights_t *fw,
 RF_INLINE const uint8_t *rt_take(rt_workspace_t *rt,int kind,int index,
                                   int yt,int start,const uint8_t *src,int n) {
     if(rt->mode==RT_DDR) return src;
+#if defined(RT_ENABLE_AIDMA)
+    if(rt->mode==RT_AIDMA || rt->mode==RT_AIDMA_PIN)
+        return rt_ai_take(rt,kind,index,yt,start,src,n);
+#endif
     uint8_t *bank = kind==RT_KIND_Q ? rt->q_bank :
                     kind==RT_KIND_KV ? rt->kv_bank : rt->wo_bank;
     if(rt->mode==RT_PIN) {
