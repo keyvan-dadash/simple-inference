@@ -1,7 +1,8 @@
 // One-token Qwen2.5-Coder-1.5B attention sublayer. No inference engine.
 // Q4_0 weights x on-the-fly Q8_0 activations -> FP32 Q/K/V -> RoPE
-// -> synthetic FP16 KV history + online GQA -> Q8_0 x Q4_0 output projection.
+// -> synthetic FP16 KV history + selectable GQA -> Q8_0 x Q4_0 output projection.
 // Meant for isolated profiling and later fusion experiments, NOT text inference.
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <inttypes.h>
@@ -11,28 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <assert.h>
 
-#ifndef USE_RVV
-#define USE_RVV 0
-#endif
-#if USE_RVV && defined(__riscv_vector)
-#include <riscv_vector.h>
-#define HAVE_RVV 1
-#else
-#define HAVE_RVV 0
-#endif
-
-#define HIDDEN 1536
-#define QHEADS 12
-#define KVHEADS 2
-#define HDIM 128
-#define KVDIM (KVHEADS * HDIM)
-#define QK 32
-#define Q4_BYTES 18
-#define Q8_BYTES 34
-#define ROPE_BASE 1000000.0f
-#define RMS_EPS 1e-6f
+#include "defines.h"
 
 typedef struct { uint16_t d; int8_t qs[QK]; } block_q8_0;
 _Static_assert(sizeof(block_q8_0) == Q8_BYTES, "Q8_0 layout should be 34 bytes");
@@ -166,7 +147,6 @@ static inline int32_t dot_32_q4q8(const uint8_t *w, const int8_t *a) {
     vint32m1_t sum = __riscv_vwredsum_vs_i16m2_i32m1(products, zero, vl);
     return __riscv_vmv_x_s_i32m1_i32(sum);
 #else
-    assert(0 == 1);
     int32_t result = 0;
     for (int j = 0; j < 16; ++j) {
         uint8_t q = w[2 + j];
@@ -214,37 +194,8 @@ static void rope(float *heads, int nheads, int position) {
     }
 }
 
-// Standard per-head online softmax: no materialized S-by-S score buffer.
-static void attention_one_head(const float *q, const uint16_t *key_cache,
-                               const uint16_t *value_cache, int group,
-                               int context, float *out) {
-    float max_score = -INFINITY;
-    float normalizer = 0.0f;
-    memset(out, 0, HDIM * sizeof(*out));
-    for (int t = 0; t < context; t++) {
-        const uint16_t *k = key_cache + ((size_t)t * KVHEADS + group) * HDIM;
-        const uint16_t *v = value_cache + ((size_t)t * KVHEADS + group) * HDIM;
-        float score = 0.0f;
-        for (int d = 0; d < HDIM; d++) score += q[d] * f16_to_f32(k[d]);
-        score *= (1.0f / sqrtf((float)HDIM));
-        float new_max = fmaxf(max_score, score);
-        float alpha = expf(max_score - new_max);
-        float beta = expf(score - new_max);
-        normalizer = normalizer * alpha + beta;
-        for (int d = 0; d < HDIM; d++)
-            out[d] = out[d] * alpha + beta * f16_to_f32(v[d]);
-        max_score = new_max;
-    }
-    float inv = 1.0f / normalizer;
-    for (int d = 0; d < HDIM; d++) out[d] *= inv;
-}
-
-static void attention_all(const float *q, const uint16_t *kc,
-                          const uint16_t *vc, int context, float *out) {
-    for (int h = 0; h < QHEADS; ++h)
-        attention_one_head(q + h * HDIM, kc, vc, h / (QHEADS / KVHEADS),
-                           context, out + h * HDIM);
-}
+// Shared standard/online attention kernels: same Q and FP16 KV tensors.
+#include "attention_kernels.h"
 
 static void *load_file(const char *dir, const char *name, size_t expected,
                        int optional) {
@@ -297,7 +248,9 @@ static void fill_kv_history(uint16_t *kc, uint16_t *vc, int context) {
 
 static phase_t run_layer(const layer_t *l, const float *x,
                          uint16_t *kc, uint16_t *vc, int context,
-                         float *output) {
+                         float *output, attention_method_t method,
+                         float *scores, float *attn_copy,
+                         block_q8_0 *q8_copy) {
     float normed[HIDDEN], q[HIDDEN], k[KVDIM], v[KVDIM], attn[HIDDEN];
     block_q8_0 inq8[HIDDEN / QK], attq8[HIDDEN / QK];
     phase_t p = {0};
@@ -325,7 +278,7 @@ static phase_t run_layer(const layer_t *l, const float *x,
     }
     next = seconds_now(); p.rope_cache = next - t; t = next;
 
-    attention_all(q, kc, vc, context, attn);
+    attention_compute(method, q, kc, vc, context, attn, scores);
     next = seconds_now(); p.attention = next - t; t = next;
 
     quantize_q8(attn, attq8, HIDDEN);
@@ -333,8 +286,13 @@ static phase_t run_layer(const layer_t *l, const float *x,
 
     matvec_q4q8(l->wo, attq8, HIDDEN, HIDDEN, NULL, output);
     next = seconds_now(); p.out_proj = next - t;
+    // Optional correctness captures are outside every timed stage.
+    if (attn_copy) memcpy(attn_copy, attn, sizeof(attn));
+    if (q8_copy) memcpy(q8_copy, attq8, sizeof(attq8));
     return p;
 }
+
+#include "fused_layer.h"
 
 // Human-readable sizes are binary KiB/MiB. These are storage footprints,
 // NOT the bytes transferred by hardware: data can be read many times.
@@ -361,7 +319,7 @@ typedef struct {
 } report_row_t;
 
 static void report(const phase_t *p, const layer_t *l, int context,
-                   int repeat, const float *out) {
+                   int repeat, const float *out, attention_method_t method) {
     const size_t q_bytes = (size_t)HIDDEN * HIDDEN / QK * Q4_BYTES;
     const size_t kv_proj_bytes = (size_t)KVDIM * HIDDEN / QK * Q4_BYTES;
     const size_t q8_bytes = (size_t)(HIDDEN / QK) * Q8_BYTES;
@@ -379,7 +337,8 @@ static void report(const phase_t *p, const layer_t *l, int context,
         {"K projection",       "FP32 [2 x 128]",  "", p->k_proj},
         {"V projection",       "FP32 [2 x 128]",  "", p->v_proj},
         {"RoPE + KV append",   "KV cache update", "", p->rope_cache},
-        {"GQA online attention","FP32 [12 x 128]","", p->attention},
+        {method == ATTENTION_FLASH ? "GQA online (flash)" : "GQA score/softmax",
+         "FP32 [12 x 128]", "", p->attention},
         {"Quantize attention", "Q8_0 [48 blocks]", "", p->q8_output},
         {"Output projection",  "FP32 [1536]",     "", p->out_proj},
     };
@@ -411,8 +370,9 @@ static void report(const phase_t *p, const layer_t *l, int context,
     format_bytes(kv_cache_bytes, kvsize, sizeof(kvsize));
 
     printf("\nQwen2.5-Coder-1.5B | one attention sublayer (decode)\n");
-    printf("Context: %d tokens  |  Repeats: %d  |  RVV dot: %s\n",
-           context, repeat, HAVE_RVV ? "enabled" : "disabled (scalar fallback)");
+    printf("Attention: %s | Context: %d tokens | Repeats: %d | RVV dot: %s\n",
+           attention_name(method), context, repeat,
+           HAVE_RVV ? "enabled" : "disabled (scalar fallback)");
     printf("Weights: Q4_0  |  Matvec activations: Q8_0  |  KV cache: FP16\n");
     printf("Timings exclude model loading, synthetic input generation and setup.\n\n");
 
@@ -446,45 +406,327 @@ static void report(const phase_t *p, const layer_t *l, int context,
     printf("Output checksum: %.9g  |  First 4: [%.6g, %.6g, %.6g, %.6g]\n",
            checksum, out[0], out[1], out[2], out[3]);
     puts("Note: data sizes are footprints, not measured memory traffic; times are averages/sums over repeats.");
-    puts("      Synthetic input/KV history; no full inference or fusion is performed.\n");
+    puts("      Flash mode fuses score/softmax/value computation ONLY; no attention-to-W_O fusion.\n");
+}
+
+
+static void phase_add(phase_t *sum, phase_t p) {
+    sum->rms       += p.rms;
+    sum->q8_input  += p.q8_input;
+    sum->q_proj    += p.q_proj;
+    sum->k_proj    += p.k_proj;
+    sum->v_proj    += p.v_proj;
+    sum->rope_cache+= p.rope_cache;
+    sum->attention += p.attention;
+    sum->q8_output += p.q8_output;
+    sum->out_proj  += p.out_proj;
+}
+
+static void phase_vector(const phase_t *p, double t[9]) {
+    t[0]=p->rms;       t[1]=p->q8_input; t[2]=p->q_proj;
+    t[3]=p->k_proj;    t[4]=p->v_proj;   t[5]=p->rope_cache;
+    t[6]=p->attention; t[7]=p->q8_output;t[8]=p->out_proj;
+}
+
+static void report_compare(const phase_t *st, const phase_t *fl,
+                           const layer_t *l, int context, int repeat,
+                           const float *out_st, const float *out_fl,
+                           const float *att_st, const float *att_fl,
+                           const block_q8_0 *q8_st,
+                           const block_q8_0 *q8_fl) {
+    const char *ops[] = {
+        "RMSNorm", "Quantize input", "Q projection", "K projection",
+        "V projection", "RoPE + KV append", "GQA attention",
+        "Quantize attention", "Output projection"
+    };
+    const char *shapes[] = {
+        "FP32 [1536]", "Q8_0 [48 blocks]", "FP32 [12 x 128]",
+        "FP32 [2 x 128]", "FP32 [2 x 128]", "KV cache update",
+        "FP32 [12 x 128]", "Q8_0 [48 blocks]", "FP32 [1536]"
+    };
+    char datas[9][36];
+    const size_t qsize = (size_t)HIDDEN * HIDDEN / QK * Q4_BYTES;
+    const size_t kvsize = (size_t)KVDIM * HIDDEN / QK * Q4_BYTES;
+    const size_t cache_size = (size_t)context * KVDIM * sizeof(uint16_t) * 2;
+    const size_t q8size = (HIDDEN / QK) * Q8_BYTES;
+    data_label(datas[0], sizeof(datas[0]), l->norm ? "Norm" : "Norm absent",
+               l->norm ? HIDDEN * sizeof(float) : 0);
+    data_label(datas[1], sizeof(datas[1]), "Q8 buffer", q8size);
+    data_label(datas[2], sizeof(datas[2]), "Wq Q4_0", qsize);
+    data_label(datas[3], sizeof(datas[3]), "Wk Q4_0", kvsize);
+    data_label(datas[4], sizeof(datas[4]), "Wv Q4_0", kvsize);
+    data_label(datas[5], sizeof(datas[5]), "New K+V", KVDIM * sizeof(uint16_t) * 2);
+    data_label(datas[6], sizeof(datas[6]), "KV cache", cache_size);
+    data_label(datas[7], sizeof(datas[7]), "Q8 buffer", q8size);
+    data_label(datas[8], sizeof(datas[8]), "Wo Q4_0", qsize);
+
+    double a[9], b[9], ta=0.0, tb=0.0;
+    phase_vector(st,a); phase_vector(fl,b);
+    puts("\nQwen2.5-Coder-1.5B | single attention sublayer | STANDARD vs FLASH");
+    printf("Context: %d | Repeats: %d per mode | RVV quantized dot: %s\n",
+           context, repeat, HAVE_RVV ? "yes" : "no (scalar fallback)");
+    puts("Weights Q4_0 | Activations Q8_0 | KV FP16 | Same tensors and W_O kernel");
+    puts("FLASH = existing streaming online-softmax; STANDARD = materialized QK scores.");
+    puts("Timings exclude model loading, synthetic setup, captures and output comparison.\n");
+    puts("----------------------------------------------------------------------------------------------------------------------");
+    printf(" %3s  %-21s %-18s %-21s %12s %12s %10s\n",
+           "#", "Operation", "Output", "Weights/data", "Std ms/run", "Flash ms/run", "Speedup");
+    puts("----------------------------------------------------------------------------------------------------------------------");
+    for (int i=0; i<9; ++i) {
+        ta += a[i]; tb += b[i];
+        const double ams=a[i]*1000.0/repeat, bms=b[i]*1000.0/repeat;
+        printf(" %3d  %-21s %-18s %-21s %12.3f %12.3f %9.3fx\n",
+               i+1,ops[i],shapes[i],datas[i],ams,bms,bms>0?ams/bms:0.0);
+    }
+    puts("----------------------------------------------------------------------------------------------------------------------");
+    printf("      %-21s %-18s %-21s %12.3f %12.3f %9.3fx\n",
+           "TOTAL (timed)","","",ta*1000.0/repeat,tb*1000.0/repeat,
+           tb>0?ta/tb:0.0);
+    double fa=(a[6]+a[7]+a[8])*1000.0/repeat;
+    double fb=(b[6]+b[7]+b[8])*1000.0/repeat;
+    printf("      %-21s %-18s %-21s %12.3f %12.3f %9.3fx\n",
+           "Future fusion region","attention + Q8 + W_O", "",
+           fa,fb,fb>0?fa/fb:0.0);
+
+    double max_att_diff=0.0, max_att_rel=0.0;
+    double max_out_diff=0.0, max_out_rel=0.0;
+    double st_sum=0.0, fl_sum=0.0;
+    for (int i=0; i<HIDDEN; ++i) {
+        if (!isfinite(out_st[i]) || !isfinite(out_fl[i]) ||
+            !isfinite(att_st[i]) || !isfinite(att_fl[i]))
+            die("Non-finite output in attention comparison");
+        double d=fabs((double)att_st[i]-att_fl[i]);
+        double denom=fmax(fabs((double)att_st[i]),fabs((double)att_fl[i]));
+        if(d>max_att_diff) max_att_diff=d;
+        if(denom>1e-6 && d/denom>max_att_rel) max_att_rel=d/denom;
+        d=fabs((double)out_st[i]-out_fl[i]);
+        denom=fmax(fabs((double)out_st[i]),fabs((double)out_fl[i]));
+        if(d>max_out_diff) max_out_diff=d;
+        if(denom>1e-6 && d/denom>max_out_rel) max_out_rel=d/denom;
+        st_sum += out_st[i]; fl_sum += out_fl[i];
+    }
+    int changed_q8=0;
+    for (int i=0; i<HIDDEN/QK; ++i)
+        changed_q8 += memcmp(&q8_st[i],&q8_fl[i],sizeof(block_q8_0))!=0;
+    printf("\nCorrectness (same projected inputs; FP32 rounding may differ):\n");
+    printf("  Attention O[1536]: max_abs=%.7g, max_rel=%.7g\n",max_att_diff,max_att_rel);
+    printf("  Quantized attention: %d / %d Q8_0 blocks differ\n",changed_q8,HIDDEN/QK);
+    printf("  Final W_O result:   max_abs=%.7g, max_rel=%.7g\n",max_out_diff,max_out_rel);
+    printf("  Output checksums: standard=%.9g, flash=%.9g\n",st_sum,fl_sum);
+    if (max_att_diff > 1e-3 || changed_q8 > 0)
+        puts("  NOTE: The online and standard reductions have different rounding; check Q8 differences before interpreting projection speedup.");
+    puts("\nThis is attention-kernel comparison, not attention-to-W_O projection fusion.");
+    puts("Std/Flash timings reflect C implementations, not optimized RVV FlashAttention-V.");
+    puts("Mode order alternates on successive repeats to reduce first-run bias.\n");
+}
+
+static void fused_stats_add(fused_stats_t *sum, fused_stats_t p) {
+    phase_add(&sum->phase, p.phase);
+    sum->tcm_stage += p.tcm_stage;
+}
+
+static double checksum_and_validate(const float *y) {
+    double v=0.0;
+    for (int i=0; i<HIDDEN; ++i) {
+        if (!isfinite(y[i])) die("Non-finite fused output");
+        v += (double)y[i];
+    }
+    return v;
+}
+
+static void report_fusion(const phase_t *base, const fused_stats_t *fused,
+                          int context, int repeat, int tcm_mode,
+                          const float *y_ref, const float *y_fused,
+                          const float *att_ref, const float *att_fused,
+                          const block_q8_0 *q8_ref,
+                          const block_q8_0 *q8_fused) {
+    const char *names[9] = { "RMSNorm", "Quantize X", "Wq", "Wk", "Wv",
+                             "RoPE + KV append", "Online attention (GQA)",
+                             "Quantize O", "W_o" };
+    double a[9], b[9], base_total=0.0;
+    phase_vector(base,a);
+    phase_vector(&fused->phase,b);
+    for (int i=0;i<9;i++) base_total += a[i];
+    double fused_compute = fused_total(fused) - fused->tcm_stage;
+    printf("\nQwen2.5-Coder-1.5B | BASELINE vs 2-HEAD COLUMN-SoA FUSED\n");
+    printf("One token | context=%d | repeats=%d/mode | RVV=%s | TCM=%s\n",
+           context,repeat,HAVE_RVV ? "yes" : "no",tcm_mode ? "enabled" : "off");
+    printf("All weights remain 4-bit Q4_0; activations Q8_0; KV FP16.\n");
+    printf("One token, two heads, 256 output neurons per RVV tile.\n");
+    puts("--------------------------------------------------------------------------");
+    printf(" %-24s %15s %15s %10s\n", "Operation", "Baseline ms", "Fused ms", "Speedup");
+    puts("--------------------------------------------------------------------------");
+    for (int i=0;i<9;i++) {
+        if (i==4) continue; // K/V are interleaved and timed together.
+        double av=(a[i]+(i==3?a[4]:0))*1000.0/repeat;
+        double fv=(b[i]+(i==3?b[4]:0))*1000.0/repeat;
+        const char *label = i==3 ? "Wk + Wv (interleaved)" : names[i];
+        printf(" %-24s %15.3f %15.3f %9.3fx\n",
+               label,av,fv,fv>0 ? av/fv : 0.0);
+    }
+    puts("--------------------------------------------------------------------------");
+    printf(" %-24s %15.3f %15.3f %9.3fx\n", "Compute only",
+           base_total*1000/repeat, fused_compute*1000/repeat,
+           fused_compute>0 ? base_total/fused_compute:0.0);
+    printf(" %-24s %15s %15.3f\n", "TCM staging (14 tiles)", "-",
+           fused->tcm_stage*1000/repeat);
+    printf(" %-24s %15.3f %15.3f %9.3fx\n", "TOTAL (inc. staging)",
+           base_total*1000/repeat, fused_total(fused)*1000/repeat,
+           fused_total(fused)>0?base_total/fused_total(fused):0.0);
+    double aw=(a[6]+a[7]+a[8])*1000/repeat;
+    double bw=(b[6]+b[7]+b[8])*1000/repeat;
+    printf(" %-24s %15.3f %15.3f %9.3fx\n", "Attention + Q8 + W_o",
+           aw,bw,bw>0?aw/bw:0.0);
+    double max_att=0, max_y=0, max_rel=0;
+    for (int i=0;i<HIDDEN;i++) {
+        double da=fabs((double)att_ref[i]-att_fused[i]);
+        double dy=fabs((double)y_ref[i]-y_fused[i]);
+        double denominator=fmax(fabs((double)y_ref[i]),fabs((double)y_fused[i]));
+        if (da>max_att) max_att=da;
+        if (dy>max_y) max_y=dy;
+        if (denominator>1e-6 && dy/denominator>max_rel) max_rel=dy/denominator;
+    }
+    int q8diff=0;
+    for (int i=0;i<HIDDEN/QK;i++)
+        q8diff += memcmp(&q8_ref[i], &q8_fused[i],sizeof(block_q8_0)) != 0;
+    printf("\nCorrectness: attention max_abs=%.8g, Q8 blocks different=%d/48\n",
+           max_att,q8diff);
+    printf("             output max_abs=%.8g, output max_rel=%.8g\n",max_y,max_rel);
+    printf("             checksum baseline=%.10g fused=%.10g\n",
+           checksum_and_validate(y_ref),checksum_and_validate(y_fused));
+    puts("NOTE: vector dot-reduction and float accumulation may round differently.");
+    puts("TCM staging is counted separately; initial file loading and repacking are not.");
+    puts("Fused uses paired attention, not a prefill tile or a full-model inference engine.\n");
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 4) {
-        fprintf(stderr, "Usage: %s <weights_directory> [context=256] [repeat=1]\n", argv[0]);
+    if (argc < 2 || argc > 5) {
+        fprintf(stderr,
+                "Usage: %s <weights_directory> [context=256] [repeat=1] [standard|flash|compare|fused|fused-compare]\n",
+                argv[0]);
         return 2;
     }
-    char *end;
+    char *end = NULL;
     long context = argc >= 3 ? strtol(argv[2], &end, 10) : 256;
     if (argc >= 3 && *end) die("Invalid context argument");
     long repeat = argc >= 4 ? strtol(argv[3], &end, 10) : 1;
     if (argc >= 4 && *end) die("Invalid repeat argument");
     if (context < 1 || context > 32768 || repeat < 1 || repeat > 100000)
         die("Context must be 1..32768 and repeat 1..100000");
+    const char *mode = argc >= 5 ? argv[4] : "compare";
+    int compare = strcmp(mode,"compare")==0;
+    int fused_mode = strcmp(mode,"fused")==0 || strcmp(mode,"fused-compare")==0;
+    int fused_compare = strcmp(mode,"fused-compare")==0;
+    int selected = strcmp(mode,"standard")==0 ? ATTENTION_STANDARD : ATTENTION_FLASH;
+    if (!compare && !fused_mode && strcmp(mode,"standard") && strcmp(mode,"flash"))
+        die("Attention mode must be standard, flash, compare, fused or fused-compare");
 
     layer_t l = load_layer(argv[1]);
     float *input = malloc(HIDDEN * sizeof(float));
-    float *output = malloc(HIDDEN * sizeof(float));
     uint16_t *kc = malloc((size_t)context * KVDIM * sizeof(uint16_t));
     uint16_t *vc = malloc((size_t)context * KVDIM * sizeof(uint16_t));
-    if (!input || !output || !kc || !vc) die("Out of memory creating synthetic inputs");
-    for (int i = 0; i < HIDDEN; i++) input[i] = random_float();
-    fill_kv_history(kc, vc, (int)context);
-    phase_t summed = {0};
-    for (long r = 0; r < repeat; r++) {
-        phase_t p = run_layer(&l, input, kc, vc, (int)context, output);
-        summed.rms += p.rms;
-        summed.q8_input += p.q8_input;
-        summed.q_proj += p.q_proj;
-        summed.k_proj += p.k_proj;
-        summed.v_proj += p.v_proj;
-        summed.rope_cache += p.rope_cache;
-        summed.attention += p.attention;
-        summed.q8_output += p.q8_output;
-        summed.out_proj += p.out_proj;
+    float *scores = malloc((size_t)QHEADS * (size_t)context * sizeof(float));
+    float *output[2] = {malloc(HIDDEN*sizeof(float)), NULL};
+    float *attn[2] = {NULL,NULL};
+    block_q8_0 *q8[2] = {NULL,NULL};
+    if (compare) {
+        output[1]=malloc(HIDDEN*sizeof(float));
+        attn[0]=malloc(HIDDEN*sizeof(float));
+        attn[1]=malloc(HIDDEN*sizeof(float));
+        q8[0]=malloc((HIDDEN/QK)*sizeof(block_q8_0));
+        q8[1]=malloc((HIDDEN/QK)*sizeof(block_q8_0));
     }
-    report(&summed, &l, (int)context, (int)repeat, output);
-    free(input); free(output); free(kc); free(vc);
+    if (!input || !kc || !vc || !scores || !output[0] ||
+        (compare && (!output[1] || !attn[0] || !attn[1] || !q8[0] || !q8[1])))
+        die("Out of memory creating synthetic inputs and comparison buffers");
+    for (int i=0;i<HIDDEN;i++) input[i]=random_float();
+    fill_kv_history(kc,vc,(int)context);
+
+    phase_t sums[2]={0};
+    if (fused_mode) {
+        const char *tcmstr=getenv("FUSED_TCM");
+        int tcm_enabled=tcmstr && atoi(tcmstr)!=0;
+        const char *blockstr=getenv("TCM_BLOCK");
+        int tcm_block=blockstr ? atoi(blockstr) : 0;
+        fused_weights_t fw=fused_weights_load(argv[1], tcm_enabled, tcm_block);
+        float *fy=malloc(HIDDEN*sizeof(float));
+        float *a0=malloc(HIDDEN*sizeof(float));
+        float *a1=malloc(HIDDEN*sizeof(float));
+        block_q8_0 *b0=malloc((HIDDEN/QK)*sizeof(block_q8_0));
+        block_q8_0 *b1=malloc((HIDDEN/QK)*sizeof(block_q8_0));
+        if (!fy||!a0||!a1||!b0||!b1) die("Out of memory for fused comparison");
+        fused_stats_t fs={0};
+        if (fused_compare) {
+            // Both use the same already-loaded tensors; alternate run order.
+            for (int i=0;i<4;i++) {
+                if (i==0 || i==3)
+                    (void)run_layer(&l,input,kc,vc,(int)context,output[0],
+                                    ATTENTION_FLASH,scores,NULL,NULL);
+                else
+                    (void)run_layer_fused(&l,&fw,input,kc,vc,(int)context,fy,NULL,NULL);
+            }
+            for (long r=0;r<repeat;r++) {
+                for (int j=0;j<2;j++) {
+                    int method = (r&1L) ? 1-j : j;
+                    if (method==0) {
+                        phase_t pp=run_layer(&l,input,kc,vc,(int)context,output[0],
+                                             ATTENTION_FLASH,scores,a0,b0);
+                        phase_add(&sums[0],pp);
+                    } else {
+                        fused_stats_t fp=run_layer_fused(&l,&fw,input,kc,vc,
+                                               (int)context,fy,a1,b1);
+                        fused_stats_add(&fs,fp);
+                    }
+                }
+            }
+            report_fusion(&sums[0],&fs,(int)context,(int)repeat,tcm_enabled,
+                          output[0],fy,a0,a1,b0,b1);
+        } else {
+            for (long r=0;r<repeat;r++) {
+                fused_stats_t fp=run_layer_fused(&l,&fw,input,kc,vc,
+                                                 (int)context,fy,NULL,NULL);
+                fused_stats_add(&fs,fp);
+            }
+            double ch=checksum_and_validate(fy);
+            printf("FUSED one-token 2-head | context=%ld repeats=%ld RVV=%s TCM=%s\n",
+                   context,repeat,HAVE_RVV?"yes":"no", tcm_enabled?"yes":"no");
+            printf("Compute %.3f ms/token, staging %.3f ms/token, all %.3f ms/token\n",
+                   (fused_total(&fs)-fs.tcm_stage)*1e3/repeat,
+                   fs.tcm_stage*1e3/repeat,fused_total(&fs)*1e3/repeat);
+            printf("Output checksum %.10g | first four %.6g %.6g %.6g %.6g\n",
+                   ch,fy[0],fy[1],fy[2],fy[3]);
+        }
+        free(fy);free(a0);free(a1);free(b0);free(b1);
+        fused_weights_free(&fw);
+    } else if (compare) {
+        // Alternating-order warmup, excluded from all measurements.
+        for (int i=0;i<4;i++) {
+            int method = (i==0 || i==3) ? ATTENTION_STANDARD : ATTENTION_FLASH;
+            (void)run_layer(&l,input,kc,vc,(int)context,output[method],
+                            (attention_method_t)method,scores,NULL,NULL);
+        }
+        for (long r=0;r<repeat;r++) {
+            for (int j=0;j<2;j++) {
+                int method = ((r&1L)==0) ? j : 1-j;
+                phase_t p=run_layer(&l,input,kc,vc,(int)context,output[method],
+                                    (attention_method_t)method,scores,
+                                    attn[method],q8[method]);
+                phase_add(&sums[method],p);
+            }
+        }
+        report_compare(&sums[0],&sums[1],&l,(int)context,(int)repeat,
+                       output[0],output[1],attn[0],attn[1],q8[0],q8[1]);
+    } else {
+        for (long r=0;r<repeat;r++) {
+            phase_t p=run_layer(&l,input,kc,vc,(int)context,output[0],
+                                (attention_method_t)selected,scores,NULL,NULL);
+            phase_add(&sums[0],p);
+        }
+        report(&sums[0],&l,(int)context,(int)repeat,output[0],
+               (attention_method_t)selected);
+    }
+    free(input); free(kc); free(vc); free(scores);
+    for (int i=0;i<2;i++) {free(output[i]);free(attn[i]);free(q8[i]);}
     free_layer(&l);
     return 0;
 }
